@@ -2,408 +2,349 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <unistd.h>
-#include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
-#include <sys/shm.h>
+#include <sys/mman.h>
 #include <param/param.h>
-#include <pthread.h>
-#include <signal.h>
-#include <stdatomic.h>
+#include <csp/csp_types.h>
+#include <param/param_client.h>
+#include <glob.h>
+#include <time.h>
+#include "pipeline_executor.h"
 #include "dipp_error.h"
 #include "dipp_config.h"
 #include "dipp_process.h"
-#include "dipp_process_param.h"
 #include "dipp_paramids.h"
+#include "priority_queue.h"
+#include "cost_store.h"
 #include "vmem_storage.h"
-// #include "vmem_upload.h"
+#include "heuristics.h"
+#include "process_module.h"
+#include "image_store.h"
+#include "image_batch.h"
 #include "vmem_upload_local.h"
-#include "metadata.pb-c.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
-#include "logger.h"
+#include "utils/minitrace.h"
 
-static int output_pipe[2]; // Pipe for inter-process result communication
-static int error_pipe[2];  // Pipe for inter-process error communication
+PriorityQueue *ingest_pq = NULL;
+PriorityQueue *partially_processed_pq = NULL;
+PriorityQueueImpl *pq_impl = NULL;
 
-Logger *logger;
+CostStoreImpl *cost_store_impl = NULL;
+CostStore *cost_store = NULL;
 
-// Signal handler for timeout
-void timeout_handler(int signum) {
-    printf("Module timeout reached\n");
-    uint16_t error_code = MODULE_EXIT_TIMEOUT;
-    write(error_pipe[1], &error_code, sizeof(uint16_t));
-    exit(EXIT_FAILURE); // Exit the child process with failure status
-}
+StorageMode global_storage_mode = STORAGE_MMAP;
 
-int execute_module_in_process(ProcessFunction func, ImageBatch *input, ModuleParameterList *config)
+Heuristic *current_heuristic = NULL;
+
+// Process a single image batch, either fully or partially
+// It executes the pipeline, either fully or partially, depending
+// on the available resources. Based on this, it either uploads
+// and cleans up the image batch, or pushes the image batch onto the
+// partially processed queue.
+void process(ImageBatch *input_batch)
 {
-    // Create a new process
-    pid_t pid = fork();
+    MTR_BEGIN_FUNC_S("batch_uuid", input_batch->uuid);
+    printf("Processing batch with pipeline ID %d, progress %d\n", input_batch->pipeline_id, input_batch->progress);
+    int pipeline_result = load_pipeline_and_execute(input_batch);
+    printf("Pipeline execution returned %d\n", pipeline_result);
+    printf("Current progress after execution: %d\n", input_batch->progress);
 
-    if (pid == 0)
+    if (pipeline_result == FAILURE)
     {
-        // Set up signal handler for timeout and starm alarm timer
-        signal(SIGALRM, timeout_handler);
-        alarm(param_get_uint32(&module_timeout));
-
-        // Child process: Execute the module function
-        ImageBatch result = func(input, config, error_pipe);
-        alarm(0); // stop timeout alarm
-        size_t data_size = sizeof(result);
-        write(output_pipe[1], &result, data_size); // Write the result to the pipe
-        exit(EXIT_SUCCESS);
+        // Something went wrong during the execution.
+        // TODO: Consider possible retries
+        MTR_END_FUNC();
+        return;
     }
     else
     {
-        // Parent process: Wait for the child process to finish
-        int status;
-        waitpid(pid, &status, 0);
-
-        if (WIFEXITED(status))
+        int pipeline_length = get_pipeline_length(input_batch->pipeline_id);
+        if (pipeline_length == FAILURE)
         {
-            // Child process exited normally (EXIT_FAILURE)
-            if (WEXITSTATUS(status) != 0)
+            printf("Error getting pipeline length\n");
+            MTR_END_FUNC();
+            return;
+        }
+        if (input_batch->progress == pipeline_length - 1)
+        {
+            printf("Pipeline fully executed successfully\n");
+
+            image_batch_read_data(input_batch);
+            if (input_batch->data == NULL)
             {
-                uint16_t module_error;
-                size_t res = read(error_pipe[0], &module_error, sizeof(uint16_t));
-                if (res == FAILURE)
-                    set_error_param(PIPE_READ);
-                else if (res == 0)
-                    set_error_param(MODULE_EXIT_NORMAL);
-                else if (module_error < 100)
-                    set_error_param(MODULE_EXIT_CUSTOM + module_error);
-                else
-                    set_error_param(module_error);
-
-                // invalidate cache, to be rebuilt in next pipeline invocation
-                invalidate_cache();
-
-                fprintf(stderr, "Child process exited with non-zero status\n");
-                return FAILURE;
+                printf("Error reading image data\n");
+                MTR_END_FUNC();
+                return;
             }
+
+            upload(input_batch->data, input_batch->num_images, input_batch->batch_size);
+
+            image_batch_cleanup(input_batch);
+
+            // TODO: Uncomment the following lines to delete the files after processing
+
+            // char filename_prefix[] = "/usr/share/dipp/data/batch_%s_*";
+            // char glob_pattern[sizeof(filename_prefix) + 37];
+            // snprintf(glob_pattern, sizeof(filename_prefix) + 37, filename_prefix, input_batch->uuid);
+
+            // glob_t gstruct;
+            // int r = glob(glob_pattern, GLOB_ERR, NULL, &gstruct);
+
+            // if (r == 0)
+            // {
+            //     for (size_t i = 0; i < gstruct.gl_pathc; i++)
+            //     {
+            //         remove(gstruct.gl_pathv[i]);
+            //     }
+            // }
+            // else
+            // {
+            //     printf("Error deleting files\n");
+            // }
         }
         else
         {
-            // Child process did not exit normally (CRASH)
-            set_error_param(MODULE_EXIT_CRASH);
-	        //invalidate cache
-            invalidate_cache();
-            fprintf(stderr, "Child process did not exit normally\n");
-            return FAILURE;
-        }
+            printf("Pipeline partially executed successfully\n");
 
-        return SUCCESS;
-    }
-}
+            // push the batch to the partial queue
+            if (pq_impl->enqueue(partially_processed_pq, *input_batch) != SUCCESS)
+            {
+                printf("Error: Failed to enqueue batch to partially processed queue\n");
+                MTR_END_FUNC();
+                return;
+            }
 
-int execute_pipeline(Pipeline *pipeline, ImageBatch *data)
-{   
-    /* Initiate communication pipes */
-    if (pipe(output_pipe) == -1 || pipe(error_pipe) == -1)
-    {
-        set_error_param(PIPE_CREATE);
-        return FAILURE;
-    }
-
-    for (size_t i = 0; i < pipeline->num_modules; ++i)
-    {
-        err_current_module = i + 1;
-        ProcessFunction module_function = pipeline->modules[i].module_function;
-        ModuleParameterList *module_config = &module_parameter_lists[pipeline->modules[i].module_param_id];
-
-        int module_status = execute_module_in_process(module_function, data, module_config);
-
-        if (module_status == FAILURE)
-        {
-            /* Close all active pipes */
-            close(output_pipe[0]); // Close the read end of the pipe
-            close(output_pipe[1]); // Close the write end of the pipe
-            close(error_pipe[0]);
-            close(error_pipe[1]);
-            return FAILURE;
-        }
-
-        ImageBatch result;
-        int res = read(output_pipe[0], &result, sizeof(result)); // Read the result from the pipe
-        if (res == FAILURE)
-        {
-            set_error_param(PIPE_READ);
-            return FAILURE;
-        }
-        if (res == 0)
-        {
-            set_error_param(PIPE_EMPTY);
-            return FAILURE;
-        }
-
-        data->shmid = result.shmid;
-        data->num_images = result.num_images;
-        data->batch_size = result.batch_size;
-        data->pipeline_id = result.pipeline_id;
-    }
-
-    /* Close communication pipes */
-    close(output_pipe[0]); // Close the read end of the pipe
-    close(output_pipe[1]); // Close the write end of the pipe
-    close(error_pipe[0]);
-    close(error_pipe[1]);
-
-    return SUCCESS;
-}
-
-void save_images(const char *filename_base, const ImageBatch *batch)
-{
-    uint32_t offset = 0;
-    int image_index = 0;
-
-    while (image_index < batch->num_images && offset < batch->batch_size)
-    {
-        uint32_t meta_size = *((uint32_t *)(batch->data + offset));
-        offset += sizeof(uint32_t); // Move the offset to the start of metadata
-        Metadata *metadata = metadata__unpack(NULL, meta_size, batch->data + offset);
-        offset += meta_size; // Move offset to start of image
-
-        char filename[20];
-        sprintf(filename, "%s%d.raw", filename_base, image_index);
-
-        FILE *filePtr;
-
-        // Open the file in binary mode for writing
-        filePtr = fopen(filename, "wb");
-        if (filePtr == NULL) {
-        fprintf(stderr, "Error opening file.\n");
-        return;
-        }
-
-        // Write the byte array to the file
-        fwrite(batch->data + offset, sizeof(unsigned char), metadata->size, filePtr);
-
-        // Close the file
-        fclose(filePtr);
-
-        offset += metadata->size; // Move the offset to the start of the next image block
-
-        image_index++;
-    }
-}
-
-int get_pipeline_by_id(int pipeline_id, Pipeline **pipeline)
-{
-    for (size_t i = 0; i < MAX_PIPELINES; i++)
-    {
-        if (pipelines[i].pipeline_id == pipeline_id)
-        {
-            *pipeline = &pipelines[i];
-            return SUCCESS;
+            printf("Batch pushed to partially processed queue\n");
         }
     }
-    set_error_param(INTERNAL_PID_NOT_FOUND);
-    return FAILURE;
-}
 
-int load_pipeline_and_execute(ImageBatch *input_batch)
-{
-    // Execute the pipeline with parameter values
-    Pipeline *pipeline;
-    if (get_pipeline_by_id(input_batch->pipeline_id, &pipeline) == FAILURE)
-        return FAILURE;
-
-    err_current_pipeline = pipeline->pipeline_id;
-
-    return execute_pipeline(pipeline, input_batch);
-}
-
-void process(ImageBatch *input_batch)
-{
-    // printf("Processing\n");
-    // logger_log(logger, LOG_INFO, "Processing image batch");
-    int pipeline_result = load_pipeline_and_execute(input_batch);
-    
-    // printf("Done processing\n");
-    // logger_log(logger, LOG_INFO, "Done processing image batch");
     // Reset err values
     err_current_pipeline = 0;
     err_current_module = 0;
-
-    // Attach to shared memory from id
-    void *shmaddr = shmat(input_batch->shmid, NULL, 0);
-    if (shmaddr == NULL)
-    {
-        set_error_param(SHM_ATTACH);
-        return;
-    }
-    // logger_log(logger, LOG_INFO, "Attached to shared memory");
-
-    if (pipeline_result == SUCCESS)
-    {
-        //save_images("output", input_batch);
-        input_batch->data = shmaddr;
-        // logger_log(logger, LOG_INFO, "Uploading image batch");
-            
-        //printf("Uploading\n");
-        upload(input_batch->data, input_batch->num_images, input_batch->batch_size);
-        //printf("Done uploading\n");
-        // logger_log(logger, LOG_INFO, "Done uploading image batch");
-    }
-
-    // Detach and free shared memory
-    if (shmdt(shmaddr) == -1)
-    {
-        set_error_param(SHM_DETACH);
-        perror("shmdt");
-    }
-    // logger_log(logger, LOG_INFO, "Detached from shared memory");
-    if (shmctl(input_batch->shmid, IPC_RMID, NULL) == -1)
-    {
-        set_error_param(SHM_REMOVE);
-    }
-    // logger_log(logger, LOG_INFO, "Removed shared memory");
-    //printf("Done!\n");
+    MTR_END_FUNC();
 }
 
+// Pull data from the message queue, additionally setting the storage
+// attribute of the image batch
 int get_message_from_queue(ImageBatch *datarcv, int do_wait)
 {
     int msg_queue_id;
-    if ((msg_queue_id = msgget(MSG_QUEUE_KEY, 0)) == -1) {
+    if ((msg_queue_id = msgget(MSG_QUEUE_KEY, 0)) == -1)
+    {
         set_error_param(MSGQ_NOT_FOUND);
         return FAILURE;
     }
 
-    struct {
+    struct
+    {
         long mtype;
         char mtext[sizeof(ImageBatch)];
     } msg_buffer;
 
     ssize_t msg_size = msgrcv(msg_queue_id, &msg_buffer, sizeof(msg_buffer.mtext), 1, do_wait ? 0 : IPC_NOWAIT);
-    if (msg_size == -1) {
-        set_error_param(MSGQ_EMPTY);
+    if (msg_size == -1)
+    {
+        // set_error_param(MSGQ_EMPTY);
         return FAILURE;
     }
 
+    MTR_BEGIN(__FILE__, "enqueue_onto_ingest");
+
     // Ensure that the received message size is not larger than the ImageBatch structure
-    if (msg_size > sizeof(ImageBatch)) {
-        set_error_param(MSGQ_EMPTY);
+    if (msg_size > sizeof(ImageBatch))
+    {
+        // set_error_param(MSGQ_EMPTY);
         printf("Received %ld bytes, expected %ld bytes\n", msg_size, sizeof(ImageBatch));
+        MTR_END(__FILE__, "enqueue_onto_ingest");
         return FAILURE;
     }
 
     // Copy the data to the datarcv buffer
     memcpy(datarcv, &msg_buffer, msg_size);
 
+    // set storage attribute on the image batch
+    image_batch_setup_storage(datarcv, global_storage_mode);
+
     return SUCCESS;
 }
 
-/* Process one image batch from the message queue*/
-void process_one(int do_wait)
+// Retrieve the storage mode and heuristic from environment variables
+// Defaults of MMAP and LOWEST_EFFORT are used if not set or invalid
+void get_env_vars()
 {
-    setup_cache_if_needed();
-
-    ImageBatch datarcv;
-    if (get_message_from_queue(&datarcv, do_wait) == SUCCESS)
-        process(&datarcv);
-}
-
-/* Process all image batches in the message queue*/
-void process_all(int do_wait)
-{
-    
-
-    ImageBatch datarcv;
-    while (get_message_from_queue(&datarcv, do_wait) == SUCCESS)
+    const char *storage_mode_str = getenv("STORAGE_MODE");
+    if (storage_mode_str != NULL)
     {
-        logger_log_print(logger, LOG_INFO, "Batch processing started");
-        setup_cache_if_needed();
-	    logger_log_print(logger, LOG_INFO, "Cache rebuilt");
-        process(&datarcv);
-        logger_log_print(logger, LOG_INFO, "Batch processing started");
+        if (strcmp(storage_mode_str, "MEM") == 0)
+        {
+            global_storage_mode = STORAGE_MEM;
+        }
+        else if (strcmp(storage_mode_str, "MMAP") == 0)
+        {
+            global_storage_mode = STORAGE_MMAP;
+        }
+        else
+        {
+            printf("Unknown STORAGE_MODE '%s', defaulting to MMAP\n", storage_mode_str);
+            global_storage_mode = STORAGE_MMAP;
+        }
+    }
+
+    const char *heuristic_str = getenv("HEURISTIC");
+    if (heuristic_str != NULL)
+    {
+        if (strcmp(heuristic_str, "LOWEST_EFFORT") == 0)
+        {
+            current_heuristic = &lowest_effort_heuristic;
+        }
+        else if (strcmp(heuristic_str, "BEST_EFFORT") == 0)
+        {
+            current_heuristic = &best_effort_heuristic;
+        }
+        else
+        {
+            printf("Unknown HEURISTIC '%s', defaulting to BEST_EFFORT\n", heuristic_str);
+            current_heuristic = &best_effort_heuristic;
+        }
     }
 }
 
-typedef struct ProcessThreadArgs
+void update_heuristic(int ingest_queue_depth, int partial_queue_depth)
 {
-    int all;
-    int wait;
-    param_t *param;
-} ProcessThreadArgs;
+    Heuristic *previous_heuristic = current_heuristic;
 
-atomic_int is_processing = ATOMIC_VAR_INIT(0);
+    MTR_COUNTER(__FILE__, "ingest_queue_depth", ingest_queue_depth);
+    MTR_COUNTER(__FILE__, "partial_queue_depth", partial_queue_depth);
 
-void *process_thread(void *arg)
-{
-    ProcessThreadArgs *args = (ProcessThreadArgs *)arg;
-    int all = args->all;
-    int wait = args->wait;
-    param_t *param = args->param;
-    free(args);
-
-    if (all)
-        process_all(wait);
+    int total_queue_depth = ingest_queue_depth + partial_queue_depth;
+    if (total_queue_depth < LOW_QUEUE_DEPTH_THRESHOLD
+        // && partial_queue_depth < PARTIAL_QUEUE_SIZE_THRESHOLD
+        )
+    {
+        current_heuristic = &best_effort_heuristic;
+    }
     else
-        process_one(wait);
+    {
+        // either the partially processed queue is almost full, or the total queue depth is high
+        current_heuristic = &lowest_effort_heuristic;
+    }
 
-    /* Indicate that processing is finished */
-    atomic_store(&is_processing, 0);
-    param_set_uint8(param, 0);
-
-    logger_log_print(logger, LOG_INFO, "Processing finished");
-    logger_flush(logger);
-    logger_destroy(logger);
-
-    return NULL;
+    // log in case of change
+    if (previous_heuristic != current_heuristic)
+    {
+        if (current_heuristic == &best_effort_heuristic)
+        {
+            MTR_INSTANT_C(__FILE__, "update_heuristc", "heuristic", "BEST_EFFORT");
+        }
+        else
+        {
+            MTR_INSTANT_C(__FILE__, "update_heuristc", "heuristic", "LOWEST_EFFORT");
+        }
+    }
 }
 
-void callback_run(param_t *param, int index)
+void process_images_loop()
 {
-    uint8_t param_value = param_get_uint8(param);
-    if (!param_value)
-        return;
+    MTR_BEGIN_FUNC();
 
-    /* Check whether a thread is currently processing */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong(&is_processing, &expected, 1))
+    current_heuristic = &best_effort_heuristic;
+    global_storage_mode = STORAGE_MMAP;
+
+    get_env_vars();
+
+    pq_impl = get_priority_queue_impl(global_storage_mode);
+
+    pq_impl->init(&ingest_pq, "/usr/share/dipp/queue_file");
+    pq_impl->init(&partially_processed_pq, "/usr/share/dipp/partially_processed_queue_file");
+
+    cost_store_impl = get_cost_store_impl(global_storage_mode);
+    cost_store_impl->init(&cost_store, CACHE_FILE);
+
+    // Track last flush time to ensure mtr_flush is called at most once per 100ms
+    struct timespec last_mtr_flush = {0, 0};
+
+    while (1)
     {
-        // another thread is already processing
-        return;
+        // drain the message queue (nowait)
+        ImageBatch datarcv;
+        while (get_message_from_queue(&datarcv, 0) == SUCCESS)
+        {
+            // push data onto the ingest priority queue
+            pq_impl->enqueue(ingest_pq, datarcv);
+            MTR_END(__FILE__, "enqueue_onto_ingest");
+        }
+
+        // // Only flush tracing if at least 100ms elapsed since last flush
+        // {
+        //     struct timespec now;
+        //     clock_gettime(CLOCK_MONOTONIC, &now);
+        //     long elapsed_ms = (last_mtr_flush.tv_sec == 0)
+        //                           ? LONG_MAX
+        //                           : (now.tv_sec - last_mtr_flush.tv_sec) * 1000 + (now.tv_nsec - last_mtr_flush.tv_nsec) / 1000000;
+        //     if (last_mtr_flush.tv_sec == 0 || elapsed_ms >= 100)
+        //     {
+        //         mtr_flush();
+        //         last_mtr_flush = now;
+        //     }
+        // }
+
+        // pull from the partially_processed_pq first
+        ImageBatch *batch = pq_impl->dequeue(partially_processed_pq);
+        if (batch == NULL)
+        {
+            // if empty, pull from the ingest_pq
+            batch = pq_impl->dequeue(ingest_pq);
+            if (batch == NULL)
+            {
+                // if empty, wait for new data
+                usleep(1000); // sleep for 1ms before continuing
+                continue;
+            }
+        }
+
+        setup_cache_if_needed();
+
+        update_heuristic(pq_impl->get_queue_size(ingest_pq), pq_impl->get_queue_size(partially_processed_pq));
+
+        // process the batch (maybe partially)
+        process(batch);
+
+        if (batch != NULL)
+        {
+            free(batch);
+        }
+
+        // // // if partial not full (size<10 by default), pull data from ingest_pq
+        ImageBatch *new_batch = NULL;
+        size_t queue_size = pq_impl->get_queue_size(partially_processed_pq);
+        if (queue_size < MAX_PARTIAL_QUEUE_SIZE)
+        {
+            new_batch = pq_impl->dequeue(ingest_pq);
+            if (new_batch == NULL)
+            {
+                usleep(1000); // sleep for 1ms before continuing
+                continue;
+            }
+
+            setup_cache_if_needed();
+
+            update_heuristic(pq_impl->get_queue_size(ingest_pq), pq_impl->get_queue_size(partially_processed_pq));
+
+            // process the batch (maybe partially)
+            process(new_batch);
+
+            if (new_batch != NULL)
+            {
+                free(new_batch);
+            }
+        }
     }
 
-    const char* dir = "/home/root/logs/";
-    char file_name[256];
-    time_t t = time(NULL);
-    snprintf(file_name, sizeof(file_name), "dipp_%ld.txt", t);
-
-    char full_path[512];
-    snprintf(full_path, sizeof(full_path), "%s%s", dir, file_name);
-
-    logger = logger_create(full_path);
-
-    logger_log_print(logger, LOG_INFO, "Processing started");
-
-    /* Initialize thread variables */
-    ProcessThreadArgs *args = malloc(sizeof(ProcessThreadArgs));
-    if (args == NULL)
-    {
-        // atomically update is_processing
-        atomic_store(&is_processing, 0);
-        return;
-    }
-
-    args->all = param_value % 2 == 0;
-    args->wait = param_value > 2;
-    args->param = param;
-
-    /* Execute pipeline on new thread, to allow callback to finish */
-    pthread_t processing_thread;
-    if (pthread_create(&processing_thread, NULL, process_thread, args) != 0)
-    {
-        // create thread failed
-        free(args);
-        atomic_store(&is_processing, 0);
-        return;
-    }
-
-    pthread_detach(processing_thread);
-    logger_log_print(logger, LOG_INFO, "Processing thread detatched.");
+    pq_impl->clean_up(ingest_pq);
+    pq_impl->clean_up(partially_processed_pq);
+    cost_store_impl->clean_up(cost_store);
+    MTR_END_FUNC();
 }

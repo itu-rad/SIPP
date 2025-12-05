@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+enum EffortLevel {
+    DEFAULT = 0;
+    LOW = 1;
+    MEDIUM = 2;
+    HIGH = 3;
+}
+
+// Implementation details for a module
+message Implementation {
+    int32 param_id = 1;
+    EffortLevel effort_level = 2;
+}
+
+// Module execution information
+message ModuleDefinition {
+    string name = 1;
+    repeated Implementation implementations = 2;
+}
+
+// Define a message type for pipeline configuration
+message PipelineDefinition {
+    int32 n_module_configs = 1;
+    repeated ModuleDefinition modules = 2;
+}

@@ -2,6 +2,9 @@
 #define DIPP_PROCESS_H
 
 #include "dipp_config.h"
+#include "priority_queue.h"
+#include "cost_store.h"
+#include "image_batch.h"
 
 #define MSG_QUEUE_KEY 71
 
@@ -9,25 +12,19 @@
 #define SUCCESS 0
 #define FAILURE -1
 
-// Pipeline run codes
-typedef enum PIPELINE_PROCESS
-{
-    PROCESS_STOP = 0,
-    PROCESS_ONE = 1,
-    PROCESS_ALL = 2,
-    PROCESS_WAIT_ONE = 3,
-    PROCESS_WAIT_ALL = 4
-} PIPELINE_PROCESS;
+extern PriorityQueue *ingest_pq;
+extern PriorityQueue *partially_processed_pq;
+extern CostStore *cost_store;
+extern StorageMode global_storage_mode;
 
-typedef struct ImageBatch {
-    long mtype;          /* message type to read from the message queue */
-    int num_images;      /* amount of images */
-    int batch_size;      /* size of the image batch */
-    int shmid;           /* key to shared memory segment of image data */
-    int pipeline_id;     /* id of pipeline to utilize for processing */
-    unsigned char *data; /* address to image data (in shared memory) */
-} ImageBatch;
-
-typedef ImageBatch (*ProcessFunction)(ImageBatch *, ModuleParameterList *, int *);
+// Main processing loop running in a thread
+// This loop first initialiazes queues, which possibly already hold elements,
+// if using MMAP. It then continuously drains the message queue and
+// pushes new data onto the ingest priority queue.
+// It then pulls data from the partially processed queue first, processes a single batch,
+// and optionally also pulls from the ingest queue if the partially processed queue is not full.
+// Processed data is either pushed back onto the partially processed queue (if not fully processed)
+// or uploaded (if fully processed).
+void process_images_loop();
 
 #endif

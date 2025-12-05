@@ -14,11 +14,17 @@ typedef enum ERROR_CODE
     MSGQ_NOT_FOUND = 200,
     MSGQ_EMPTY = 201,
 
-    SHM_NOT_FOUND = 300,
-    SHM_DETACH = 301,
-    SHM_REMOVE = 302,
-    SHM_ATTACH = 303,
-    SHM_STATS = 304,
+    MMAP_NOT_FOUND = 300,
+    MMAP_UNMAP = 301,
+    MMAP_MAP = 302,
+    MMAP_OPEN = 303,
+    MMAP_TRUNCATE = 304,
+    MMAP_REMOVE = 305,
+    SHM_NOT_FOUND = 306,
+    SHM_DETACH = 307,
+    SHM_REMOVE = 308,
+    SHM_ATTACH = 309,
+    SHM_STATS = 310,
 
     PIPE_READ = 400,
     PIPE_EMPTY = 401,
@@ -45,7 +51,7 @@ typedef enum ERROR_CODE
 
     INTERNAL_BROTLI_DECODE = 516,
     INTERNAL_TIMESPEC_CLOCKGETTIME = 517,
-    
+
     MODULE_EXIT_CRASH = 600,
     MODULE_EXIT_NORMAL = 601,
     MODULE_EXIT_TIMEOUT = 602,
@@ -59,7 +65,7 @@ extern uint8_t err_current_module;
 /**
  * Set the dipp error parameter to the specified error code value
  * @param error_code Code of the error
-*/
+ */
 void set_error_param(ERROR_CODE error_code);
 
 #endif

@@ -14,9 +14,13 @@
 #include "vmem_storage.h"
 #include "vmem_ring_buffer.h"
 #include "vmem_dtp_server.h"
+#include "dipp_process.h"
 #include <csp/drivers/usart.h>
 #include <csp/drivers/can_socketcan.h>
 #include <dtp/dtp.h>
+#include "telemetry.h"
+#include "battery_simulator.h"
+#include "utils/minitrace.h"
 
 void *vmem_server_task(void *param)
 {
@@ -40,9 +44,21 @@ void *dtp_server_task(void *param)
 	return NULL;
 }
 
-void *dtp_indeces_server_task(void *param) 
+void *dtp_indeces_server_task(void *param)
 {
 	dtp_indeces_server();
+	return NULL;
+}
+
+void *process_images_task(void *param)
+{
+	process_images_loop();
+	return NULL;
+}
+
+void *battery_simulator_task(void *param)
+{
+	simulate_battery();
 	return NULL;
 }
 
@@ -54,15 +70,17 @@ static void iface_init(int argc, char *argv[])
 	char *kiss_device = "/dev/ttyS1"; // Default KISS device
 	char *can_device = "vcan0";		  // Default CAN device
 	int pipeline_addr = 162;		  // Default pipeline address
+	bool enable_tracing = false;
+	char *trace_file = "trace.json";
 
 	int opt;
-	while ((opt = getopt(argc, argv, "i:p:a:")) != -1)
+	while ((opt = getopt(argc, argv, "i:p:a:t:")) != -1)
 	{
 		switch (opt)
 		{
 		case 'i':
 			// Use the provided interface instead of "ZMQ"
-			interface = optarg; 
+			interface = optarg;
 			break;
 		case 'p':
 			// Use the provided port/devices
@@ -74,8 +92,14 @@ static void iface_init(int argc, char *argv[])
 			// Use the pipeline address
 			pipeline_addr = atoi(optarg);
 			break;
+		case 't':
+			// Enable tracing
+			enable_tracing = true;
+			trace_file = optarg;
+			printf("Trace file set to: %s\r\n", trace_file);
+			break;
 		default:
-			fprintf(stderr, "Usage: %s [-i <interface>] [-p <port/device>] [-a <pipeline_address<´>]\n", argv[0]);
+			fprintf(stderr, "Usage: %s [-i <interface>] [-p <port/device>] [-a <pipeline_address>] [-t <trace_file>]\n", argv[0]);
 			exit(EXIT_FAILURE);
 		}
 	}
@@ -94,9 +118,9 @@ static void iface_init(int argc, char *argv[])
 			.baudrate = 115200,
 			.databits = 8,
 			.stopbits = 1,
-			.paritysetting = 0};  
+			.paritysetting = 0};
 
-		int error = csp_usart_open_and_add_kiss_interface(&conf, CSP_IF_KISS_DEFAULT_NAME, &iface);
+		int error = csp_usart_open_and_add_kiss_interface(&conf, CSP_IF_KISS_DEFAULT_NAME, pipeline_addr, &iface);
 		if (error != CSP_ERR_NONE)
 		{
 			csp_print("failed to add KISS interface [%s], error: %d\n", kiss_device, error);
@@ -121,6 +145,13 @@ static void iface_init(int argc, char *argv[])
 	iface->netmask = 8;
 	csp_rtable_set(0, 0, iface, CSP_NO_VIA_ADDRESS);
 	csp_iflist_add(iface);
+
+	if (enable_tracing)
+	{
+		printf("Enabling tracing to file: %s\r\n", trace_file);
+		mtr_init(trace_file);
+		mtr_register_sigint_handler();
+	}
 }
 
 int main(int argc, char *argv[])
@@ -155,6 +186,15 @@ int main(int argc, char *argv[])
 	vmem_file_init(&vmem_storage);
 	vmem_ring_init(&vmem_images);
 
+	// initialize_telemetry();
+
+	// telemetry_run_param_mode_tests();
+
+	// start_energy_measurement();
+	// sleep(10);
+	// float energy = get_energy_reading();
+	// printf("Initial energy reading: %.2f J\r\n", energy);
+
 	static pthread_t router_handle;
 	pthread_create(&router_handle, NULL, &router_task, NULL);
 
@@ -167,9 +207,15 @@ int main(int argc, char *argv[])
 	static pthread_t dtp_indeces_server_handle;
 	pthread_create(&dtp_indeces_server_handle, NULL, &dtp_indeces_server_task, NULL);
 
+	static pthread_t battery_simulator_handle;
+	pthread_create(&battery_simulator_handle, NULL, &battery_simulator_task, NULL);
+
+	static pthread_t process_images_handle;
+	pthread_create(&process_images_handle, NULL, &process_images_task, NULL);
+
 	while (1)
 	{
-		sleep(10 * 1000); // TODO: Handle kbd interupt
+		sleep(10 * 1000);
 	}
 
 	return 0;
