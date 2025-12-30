@@ -129,8 +129,14 @@ void process(ImageBatch *input_batch)
 
 // Pull data from the message queue, additionally setting the storage
 // attribute of the image batch
-int get_message_from_queue(ImageBatch *datarcv, int do_wait)
+int get_message_from_queue(ImageBatch *datarcv, int do_wait, int queue_depth)
 {
+    if (queue_depth >= MAX_QUEUE_SIZE)
+    {
+        // avoid pulling more messages if the queue is full
+        return FAILURE;
+    }
+
     int msg_queue_id;
     if ((msg_queue_id = msgget(MSG_QUEUE_KEY, 0)) == -1)
     {
@@ -166,7 +172,10 @@ int get_message_from_queue(ImageBatch *datarcv, int do_wait)
     memcpy(datarcv, &msg_buffer, msg_size);
 
     // set storage attribute on the image batch
-    image_batch_setup_storage(datarcv, global_storage_mode);
+    if (queue_depth >= MAX_QUEUE_SIZE)
+    {
+        image_batch_setup_storage(datarcv, global_storage_mode);
+    }
 
     return SUCCESS;
 }
@@ -222,7 +231,7 @@ void update_heuristic(int ingest_queue_depth, int partial_queue_depth)
     int total_queue_depth = ingest_queue_depth + partial_queue_depth;
     if (total_queue_depth < LOW_QUEUE_DEPTH_THRESHOLD
         // && partial_queue_depth < PARTIAL_QUEUE_SIZE_THRESHOLD
-        )
+    )
     {
         current_heuristic = &best_effort_heuristic;
     }
@@ -270,7 +279,7 @@ void process_images_loop()
     {
         // drain the message queue (nowait)
         ImageBatch datarcv;
-        while (get_message_from_queue(&datarcv, 0) == SUCCESS)
+        while (get_message_from_queue(&datarcv, 0, pq_impl->get_queue_size(ingest_pq)) == SUCCESS)
         {
             // push data onto the ingest priority queue
             pq_impl->enqueue(ingest_pq, datarcv);
