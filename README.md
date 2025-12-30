@@ -38,10 +38,10 @@ This script crosscompile the pipeline for using the Yocto toolchain.
 
 ## Running SIPP
 
-The executable is currently named `dipp`. Run it from the build directory:
+Run it from the build directory:
 
 ```bash
-./builddir/dipp [OPTIONS]
+./builddir/sipp [OPTIONS]
 ```
 
 ### Command Line Arguments

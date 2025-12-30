@@ -84,7 +84,7 @@ c_args = [
 	]
 
 dipp = executable(
-	'dipp',
+	'sipp',
 	sources,
 	include_directories: dirs,
 	dependencies: deps,

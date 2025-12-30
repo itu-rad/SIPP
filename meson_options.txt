@@ -1,1 +1,1 @@
-option('hostname', type : 'string', value : 'DIPP', description : 'Hostname and promt')
+option('hostname', type : 'string', value : 'SIPP', description : 'Hostname and promt')

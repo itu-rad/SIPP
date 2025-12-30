@@ -2,4 +2,4 @@
 rm -r builddir
 meson setup . builddir
 ninja -C builddir
-./builddir/dipp
+./builddir/sipp
